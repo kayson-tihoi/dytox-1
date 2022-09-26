@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class KnnMemory(nn.Module):
-    def __init__(self, memory_size=8192, dim=512) -> None:
+    def __init__(self, memory_size=16384, dim=512, topk=32) -> None:
         super().__init__()
 
         self.K = memory_size
@@ -12,6 +12,7 @@ class KnnMemory(nn.Module):
         self.queue = nn.functional.normalize(self.queue, dim=0)
 
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+        self.topk = topk
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys):
@@ -34,7 +35,7 @@ class KnnMemory(nn.Module):
 
         self.queue_ptr[0] = ptr
     
-    def forward(self, x, topk=100):
+    def forward(self, x):
         r"""
         x: the query item with shape [B, N, dim]
             where B is the batch size, N is the sequence length
@@ -46,10 +47,14 @@ class KnnMemory(nn.Module):
         """
         sim_matrix = torch.einsum('bnc,ck->bnk', [x, self.queue.clone().detach()])
 
-        _, topk_inds = torch.topk(sim_matrix, k=topk, dim=-1)
+        sim_matrix_topk, topk_inds = torch.topk(sim_matrix, k=self.topk, dim=-1)
+        sim_matrix_topk = sim_matrix_topk.softmax(dim=-1)
+
         sampled_features = self.queue[:, topk_inds.view(-1)]
         sampled_features = sampled_features.view(-1, *(topk_inds.shape))
         sampled_features = sampled_features.permute(1, 2, 3, 0)
+
+        sampled_features = (sim_matrix_topk.unsqueeze(-1) * sampled_features).sum(-2)
         
         self._dequeue_and_enqueue(x)
 

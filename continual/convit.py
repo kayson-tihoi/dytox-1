@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 import continual.utils as cutils
+from continual.knn_memory import KnnMemory
 
 
 class BatchEnsemble(nn.Module):
@@ -254,6 +255,78 @@ class MHSA(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, attn
+
+
+class KNN_MHSA(nn.Module):
+    def __init__(self, dim, knn_memory, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., fc=None, attn_scale_init=20):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.apply(self._init_weights)
+
+        # in equation (1), (2)
+        # self.learned_gate = nn.Parameter(torch.ones(num_heads, 1, 1) * math.log(attn_scale_init))
+        self.learned_gate = nn.Parameter(torch.ones(1) * math.log(attn_scale_init))
+        self.knn_memory = knn_memory
+
+    def reset_parameters(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def get_attention_map(self, x, return_map = False):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn_map = (q @ k.transpose(-2, -1)) * self.scale
+        attn_map = attn_map.softmax(dim=-1).mean(0)
+
+        img_size = int(N**.5)
+        ind = torch.arange(img_size).view(1,-1) - torch.arange(img_size).view(-1, 1)
+        indx = ind.repeat(img_size,img_size)
+        indy = ind.repeat_interleave(img_size,dim=0).repeat_interleave(img_size,dim=1)
+        indd = indx**2 + indy**2
+        distances = indd**.5
+        distances = distances.to('cuda')
+
+        dist = torch.einsum('nm,hnm->h', (distances, attn_map))
+        dist /= N
+
+        if return_map:
+            return dist, attn_map
+        else:
+            return dist
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x_c = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # import pdb; pdb.set_trace()
+        # add the information from knn memory
+        x_m, _ = self.knn_memory(x)
+        x = x_c * self.learned_gate.sigmoid() + x_m * (1 - self.learned_gate.sigmoid())
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, attn, None
 
 
 class ScaleNorm(nn.Module):
@@ -710,3 +783,203 @@ class ConVit(nn.Module):
         return x
 
 
+class KNNConVit(nn.Module):
+    """ Vision Transformer with support for patch or hybrid CNN input stage
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
+                 num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0., hybrid_backbone=None, norm_layer='layer',
+                 local_up_to_layer=3, locality_strength=1., use_pos_embed=True,
+                 class_attention=False, ca_type='base', knn_memory=None,
+        ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.local_up_to_layer = local_up_to_layer
+        self.num_features = self.final_dim = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.locality_strength = locality_strength
+        self.use_pos_embed = use_pos_embed
+
+        if norm_layer == 'layer':
+            norm_layer = nn.LayerNorm
+        elif norm_layer == 'scale':
+            norm_layer = ScaleNorm
+        else:
+            raise NotImplementedError(f'Unknown normalization {norm_layer}')
+
+        if hybrid_backbone is not None:
+            self.patch_embed = HybridEmbed(
+                hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
+        else:
+            self.patch_embed = PatchEmbed(
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+        self.num_patches = num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        if self.use_pos_embed:
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            trunc_normal_(self.pos_embed, std=.02)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
+        blocks = []
+
+        if ca_type == 'base':
+            ca_block = ClassAttention
+        elif ca_type == 'jointca':
+            ca_block = JointCA
+        else:
+            raise ValueError(f'Unknown CA type {ca_type}')
+
+        for layer_index in range(depth):
+            if layer_index < local_up_to_layer:
+                # Convit
+                block = Block(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[layer_index], norm_layer=norm_layer,
+                    attention_type=GPSA, locality_strength=locality_strength
+                )
+            elif not class_attention:
+                # Convit
+                block = Block(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[layer_index], norm_layer=norm_layer,
+                    attention_type=KNN_MHSA, knn_memory=knn_memory
+                )
+            else:
+                # CaiT
+                block = Block(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[layer_index], norm_layer=norm_layer,
+                    attention_type=ca_block
+                )
+
+            blocks.append(block)
+
+        self.blocks = nn.ModuleList(blocks)
+        self.norm = norm_layer(embed_dim)
+        self.use_class_attention = class_attention
+
+        # Classifier head
+        self.feature_info = [dict(num_chs=embed_dim, reduction=0, module='head')]
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        trunc_normal_(self.cls_token, std=.02)
+        self.head.apply(self._init_weights)
+
+    def freeze(self, names):
+        for name in names:
+            if name == 'all':
+                return cutils.freeze_parameters(self)
+            elif name == 'old_heads':
+                self.head.freeze(name)
+            elif name == 'backbone':
+                cutils.freeze_parameters(self.blocks)
+                cutils.freeze_parameters(self.patch_embed)
+                cutils.freeze_parameters(self.pos_embed)
+                cutils.freeze_parameters(self.norm)
+            else:
+                raise NotImplementedError(f'Unknown name={name}.')
+
+    def reset_classifier(self):
+        self.head.apply(self._init_weights)
+
+    def reset_parameters(self):
+        for b in self.blocks:
+            b.reset_parameters()
+        self.norm.reset_parameters()
+        self.head.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def get_internal_losses(self, clf_loss):
+        return {}
+
+    def end_finetuning(self):
+        pass
+
+    def begin_finetuning(self):
+        pass
+
+    def epoch_log(self):
+        return {}
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'pos_embed', 'cls_token'}
+
+    def get_classifier(self):
+        return self.head
+
+    def forward_sa(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        if self.use_pos_embed:
+            x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for blk in self.blocks[:self.local_up_to_layer]:
+            x, _ = blk(x)
+
+        return x
+
+    def forward_features(self, x, final_norm=True):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+
+        if self.use_pos_embed:
+            x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for blk in self.blocks[:self.local_up_to_layer]:
+            x, _, _ = blk(x)
+
+        if self.use_class_attention:
+            for blk in self.blocks[self.local_up_to_layer:]:
+                cls_tokens, _, _ = blk(torch.cat((cls_tokens, x), dim=1))
+        else:
+            x = torch.cat((cls_tokens, x), dim=1)
+            for blk in self.blocks[self.local_up_to_layer:]:
+                x, _ , _ = blk(x)
+
+        if final_norm:
+            if self.use_class_attention:
+                cls_tokens = self.norm(cls_tokens)
+            else:
+                x = self.norm(x)
+
+        if self.use_class_attention:
+            return cls_tokens[:, 0], None, None
+        else:
+            return x[:, 0], None, None
+
+    def forward(self, x):
+        x = self.forward_features(x)[0]
+        x = self.head(x)
+        return x
+
+
+if __name__ == '__main__':
+    # memory size should be the multiplier of (batchsize * 197)
+    knn_memory = KnnMemory(memory_size=16*197*100, dim=768, topk=53).cuda()
+    model = KNNConVit(knn_memory=knn_memory).cuda()
+
+    for i in range(1000):
+        x = torch.randn(4, 3, 224, 224).cuda()
+        import pdb; pdb.set_trace()
+        y = model(x)
+        print(y.shape)
